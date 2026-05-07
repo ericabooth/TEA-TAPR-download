@@ -1,6 +1,6 @@
 # TEA TAPR Data Scraper - Documentation
 
-This project contains a custom web scraper designed to automate the download of **Texas Academic Performance Report (TAPR)** data from the Texas Education Agency (TEA) website.
+This project contains a custom web scraper designed to automate the download of **Texas Academic Performance Report (TAPR)** data from the Texas Education Agency (TEA) website. This website uses a series of dropdowns and radio buttons to select year, geography, and data element for report download (along with radio buttons for each page) - there is no API or resolvable URL to download all these files or data elements. This script uses scraping libraries and browser emulation to automate downloading files from TAPR (TEA). These flat files can then be merged using codebook / header information also scraped from this site (forthcoming: Stata code to automate join/merges of these flat files).
 
 ## Files in this Directory
 
