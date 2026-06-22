@@ -56,6 +56,8 @@ In the `run()` method, there is a `time.sleep(1)` command.
 *   **To go faster:** You can reduce this to `0.5`, but be aware that TEA's servers may block your IP if you send requests too rapidly.
 *   **To be safer:** Increase this to `2` or `3` seconds.
 
+*   Forthcoming: wiring in in-stream compression via ijson to help with file sizes (or downstream stata compression and encoding to save file size by converting to labels, notes type metainformation, and -chars-). 
+
 ### 4. Changing the Output Folder
 When initializing the scraper, you can change the destination folder:
 ```python
