@@ -74,3 +74,7 @@ Example:
 ## Troubleshooting
 *   **Connection Errors:** If the script stops, it usually means the TEA server timed out. You can simply restart the script; it will overwrite existing files but resume the process.
 *   **Missing Categories:** TEA occasionally changes category names between years. This script uses dynamic discovery to find whatever is available for that specific year, so it is highly adaptable to site changes.
+
+## Author
+
+Eric A. Booth, Sr Researcher, Texas 2036 (eric.a.booth@gmail.com).
