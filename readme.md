@@ -1,80 +1,124 @@
-# TEA TAPR Data Scraper - Documentation
+# TEA TAPR data downloader
 
-This project contains a custom web scraper designed to automate the download of **Texas Academic Performance Report (TAPR)** data from the Texas Education Agency (TEA) website. This website uses a series of dropdowns and radio buttons to select year, geography, and data element for report download (along with radio buttons for each page) - there is no API or resolvable URL to download all these files or data elements. This script uses scraping libraries and browser emulation to automate downloading files from TAPR (TEA). These flat files can then be merged using codebook / header information also scraped from this site (forthcoming: Stata code to automate join/merges of these flat files).
+Downloads **Texas Academic Performance Report (TAPR)** flat files from the Texas
+Education Agency, across school years, aggregation levels and data categories.
 
-## Files in this Directory
+TEA's TAPR site has no API and no resolvable download URLs — it drives a SAS
+"broker" CGI through a series of dropdowns, radio buttons and checkboxes. This
+project automates that form flow and records enough metadata alongside each file
+to build a longitudinal panel afterwards.
 
-*   **`tapr_scraper_full.py`**: The primary script. It is designed to iterate through all school years, geographic levels, and data categories to download the complete TAPR dataset as CSV files.
-*   **`tapr_example_district.py`**: A simplified example script that downloads only the "District Reference" category for the year 2024. Use this to verify your connection and understand the logic.
+## Files
 
-## Prerequisites
+| file | what it is |
+|---|---|
+| **`tapr_download.py`** | The downloader. Handles both of TEA's TAPR applications (2013-2023 and 2024-), validates responses, retries, resumes, and writes a manifest. **Use this.** |
+| `tapr_scraper_full.py` | Original scraper. **Superseded — do not use.** It silently downloads empty files; see [DEBUGGING.md](DEBUGGING.md). Kept for reference. |
+| `tapr_example_district.py` | Minimal single-file example against the modern endpoint. Still works, useful for checking connectivity. |
+| `portal_probe.py` | Reproducible probe for the Texas Assessment Research Portal JSON API. Maps the endpoints, organization tree and query wizard. |
+| [`DEBUGGING.md`](DEBUGGING.md) | What was broken, what was verified against the live site, and TEA's own broken links. |
+| [`PLAN.md`](PLAN.md) | Plan for the longitudinal build and the Stata merge/label/clean workflow. |
+| [`SOURCES.md`](SOURCES.md) | What TAPR misses: other TEA data products, verified, with download recipes. |
+| [`PORTAL.md`](PORTAL.md) | txresearchportal.com API map and scripting plan (STAAR, STAAR Alt 2, TELPAS, with 12 breakdown dimensions). |
 
-1.  **Python 3**: Ensure you have Python 3.6 or higher installed.
-2.  **Requests Library**: The scripts use the `requests` library to handle HTTP communication.
-    ```bash
-    pip install requests
-    ```
+## Requirements
 
-## How to Run
+Python 3.9+ and `requests`:
 
-### Running the Example
-To verify the scraper works on your machine, run the example script:
 ```bash
-python3 tapr_example_district.py
+pip install requests
 ```
-This will create a `tapr_example/` folder and download a single CSV file.
 
-### Running the Full Scrape
-To start downloading the entire TAPR database:
+## Usage
+
+Download district and campus files for all available years:
+
 ```bash
-python3 tapr_scraper_full.py
-```
-**Note:** This process will take a very long time (hours or potentially days) due to the thousands of files being requested and the built-in politeness delays.
-
----
-
-## How to Modify the Script
-
-### 1. Changing the Year Range
-At the bottom of `tapr_scraper_full.py`, look for the `available_years` variable. 
-*   **Current setting:** `range(2013, 2026)` (Downloads 2012-13 through 2024-25).
-*   **To download only recent years:** Change it to `range(2022, 2026)`.
-
-### 2. Filtering Geographic Levels
-The `available_levels` list controls which aggregate data you pull:
-*   `all_c`: All Campuses
-*   `all_d`: All Districts
-*   `all_r`: All Regions
-*   `all_co`: All Counties
-*   `all_s`: Statewide
-
-If you only want Campus and District data, modify the list to:
-`available_levels = ["all_c", "all_d"]`
-
-### 3. Adjusting the Download Speed
-In the `run()` method, there is a `time.sleep(1)` command. 
-*   **To go faster:** You can reduce this to `0.5`, but be aware that TEA's servers may block your IP if you send requests too rapidly.
-*   **To be safer:** Increase this to `2` or `3` seconds.
-
-*   Forthcoming: wiring in in-stream compression via ijson to help with file sizes (or downstream stata compression and encoding to save file size by converting to labels, notes type metainformation, and -chars-). 
-
-### 4. Changing the Output Folder
-When initializing the scraper, you can change the destination folder:
-```python
-scraper = TaprScraper(output_dir="my_tapr_data")
+python3 tapr_download.py --years 2013-2025 --levels C D
 ```
 
-## Data Structure
-The script automatically organizes the downloads into a logical folder hierarchy:
-`tapr_data/ [Year] / [Level] / [Filename].csv`
+A single dataset, to try it out:
 
-Example:
-`tapr_data/2024/Campuses/2024 Campus Student Information.csv`
+```bash
+python3 tapr_download.py --years 2024 --levels D --datasets REF
+```
 
-## Troubleshooting
-*   **Connection Errors:** If the script stops, it usually means the TEA server timed out. You can simply restart the script; it will overwrite existing files but resume the process.
-*   **Missing Categories:** TEA occasionally changes category names between years. This script uses dynamic discovery to find whatever is available for that specific year, so it is highly adaptable to site changes.
+Write a variable inventory (one row per year x level x dataset x variable, with
+TEA's label text) without keeping the data — this is the input to the
+label-drift crosswalk described in `PLAN.md`:
+
+```bash
+python3 tapr_download.py --audit-years 2013-2025 --levels D
+```
+
+### Options
+
+| flag | default | meaning |
+|---|---|---|
+| `--years` | `2013-2025` | `2013-2025`, or `2019,2021`, or a mix |
+| `--levels` | `C D` | `C` campus, `D` district, `R` region, `S` state, `O` county (county is 2024+ only) |
+| `--datasets` | all | e.g. `REF STUD STAAR_ALL`. Codes differ between the two endpoints — see below |
+| `--output` | `tapr_data` | output directory |
+| `--pace` | `2.5` | base seconds between requests. Do not lower this much; TEA throttles |
+| `--no-compress` | off | write plain `.csv` instead of `.csv.gz` |
+| `--no-dictionary` | off | skip saving TEA's data-dictionary pages |
+| `--force` | off | re-download files that already exist |
+| `--audit-years` | — | write `variable_inventory.csv` and exit |
+
+## Output layout
+
+```
+tapr_data/
+  manifest.csv              status, dimensions, SHA-256 for every request
+  manifest.json
+  variable_inventory.csv    (--audit-years only)
+  2024/
+    Districts/
+      tapr_2024_D_REF.csv.gz
+      _dictionary/REF.html
+    Campuses/
+      ...
+```
+
+Runs resume: files already present are skipped, so an interrupted run can be
+restarted with the same command.
+
+## The two routes
+
+TEA serves TAPR through two incompatible interfaces, and the dataset codes are
+different, so `--datasets` values are not interchangeable between them.
+
+| `--route` | years | dataset codes | header rows |
+|---|---|---|---|
+| **`setpick`** (default) | 2013-2025 | `REF`, `STAAR1`-`STAAR6`, `PART1`/`PART2`, `STAAR_ADD1`-`5`, `TAKS1`/`TAKS2` (2013-14), `GRAD`, `COMP`, `PERF`/`PERF1`-`3`, `PROF`, `KG`, `OC`/`OG`, `PKEFF`, `ACCLER`, `STAARV`, `PARTV` — the set changes by year | 1 (varnames) |
+| `wizard` | 2024- | `REF`, `STUD`, `STAF`, `STAAR_GR3`-`GR8`, `STAAR_GR38`, `STAAR_ALL`, `STAAR_EOC`, `STAAR_SP`, `PART`, `BIL1`/`BIL2`, `KG`, `PK`, `DROP_ATT`, `COMP4`-`6`, `RHSP`, `FHSP`, `GRAD`-`GRAD4`, `APIB`, `CAD`, `ADV`, `TXIHE` — 33 codes | 2 (labels, then varnames) |
+
+**Default to `setpick`.** It covers every year 2013-2025 with one consistent
+schema — single header row, full numerator/denominator/rate coverage, and the
+same year-embedded variable names — which is what makes the years appendable.
+The script switches `prgopt` internally at 2024; you do not need to care.
+
+Use `--route wizard` when you want the categories only it offers (`STUD`,
+`STAF`, `STAAR_ALL`, `DROP_ATT`, `PK`, `APIB`, `TXIHE`, ...), or for 2025 STAAR,
+which the setpick route does not serve.
+
+Run without `--datasets` to get everything available for each year.
+
+## Scale
+
+Campus level is large: the 2024 campus `STAAR_ALL` extract alone is 20 MB raw
+(1,100 columns x 9,082 campuses), 6.5 MB gzipped. A full campus + district run
+across 2013-2025 is on the order of 10-30 GB gzipped, and takes hours — the
+pacing is deliberate and TEA will drop connections if you rush it.
+
+## Before you use the data
+
+Read [`PLAN.md`](PLAN.md) first. TAPR files are not appendable as they stand:
+the two-digit year is embedded in every variable name, labels embed the year,
+variables appear and disappear, column order moves, 2022 uses mixed-case names
+and 2023 prefixes every ID with an apostrophe. `PLAN.md` documents the
+harmonisation rules and the Stata-side workflow.
 
 ## Author
 
-Eric A. Booth, Sr Researcher, Texas 2036 (eric.a.booth@gmail.com).
+Eric A. Booth (eric.a.booth@gmail.com).
