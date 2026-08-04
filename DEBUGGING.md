@@ -11,8 +11,9 @@ of it:
 
 1. It never submits the `var_type` field, so TEA returns files containing
    identifier columns and nothing else.
-2. It points every year at an endpoint that only serves 2024 and 2025, so
-   2013-2023 return an error stub that the script writes to disk as a `.csv`.
+2. It points every year at a route that only serves SY 2023-24 and SY 2024-25,
+   so every earlier year returns an error stub that the script writes to disk
+   as a `.csv`.
 
 Both are silent. The script's own success counter reports 100% success.
 
@@ -66,19 +67,18 @@ TEA runs **three** TAPR download routes, not one:
 |---|---|---|---|---|---|
 | **Wizard** | 2024- | `prgopt=reports/tapr/dd/dd_tapr.sas`, 3-step POST | `tapr` = `all_c`/`all_d`/`all_r`/`all_co`/`all_s` | `dsname`, 33 fixed codes | **2** (labels, then varnames) |
 | **Legacy setpick** | 2013-2023 | `prgopt=<YYYY>/tapr/tapr_download.sas`, single request | `sumlev` = `C`/`D`/`R`/`S` | `setpick`, year-specific codes | **1** (varnames only) |
-| **Advanced setpick** | 2024-2025 | `prgopt=2024/tapr/Advanced Download/getdata_2024.sas` + `ccyy`, single request | `sumlev` | `setpick` | **1** |
+| **Advanced setpick** | SY 2023-24 fully; SY 2024-25 non-assessment only | `prgopt=2024/tapr/Advanced Download/getdata_2024.sas` + `ccyy`, single request | `sumlev` | `setpick` | **1** |
 
 The third route matters more than it looks, and I missed it on the first pass.
-It carries the **legacy schema forward into 2024-2025**: one header row, full
-numerator/denominator/rate coverage, and the same year-embedded variable names
-(`DDA03ARE1024D`). Verified on 2024 district `STAAR1`: 1,892 columns, 270 `D` /
-810 `N` / 810 `R`.
+It carries the **legacy schema forward through SY 2023-24**: one header row,
+full numerator/denominator/rate coverage, and the same year-embedded variable
+names (`DDA03ARE1024D`). Verified on `ccyy=2024` district `STAAR1`: 1,892
+columns, 270 `D` / 810 `N` / 810 `R`. For SY 2024-25 it carries the
+non-assessment datasets only — see below.
 
-That means a 2013-2024 panel can be built from **one** consistent format
-instead of breaking at the 2024 boundary. `tapr_download.py` now uses the
-setpick route for every year by default; `--route wizard` selects the other one
-when you want the 2024+ categories it alone offers (`STUD`, `STAF`,
-`STAAR_ALL`, `DROP_ATT`, `PK`, ...).
+That means a panel through **SY 2023-24** can be built from one consistent
+format instead of breaking a year earlier. `tapr_download.py` uses the setpick
+route through SY 2023-24 and the wizard from SY 2024-25 onward.
 
 Three caveats on the Advanced route, all verified:
 
@@ -89,8 +89,8 @@ Three caveats on the Advanced route, all verified:
 - **TEA links it from nowhere.** `/perfreport/tapr/2024/download/DownloadData.html`
   and every variant I tried are 404, and the year index pages point only at the
   wizard. It is undocumented, so confirm it still answers before a long run.
-- **2025 is partial.** `STAAR1` returns the SAS error stub for `ccyy=2025`
-  while `REF`, `PROF`, `KG`, `GRAD`, `COMP` and `PERF1` all return data.
+- **It has no assessment data for SY 2024-25.** See the section below; this is
+  the important one and I initially got it wrong.
 - **IDs carry a leading apostrophe on this route** (`'001902`, `'07`, `'001`),
   for 2024 and 2025, where the wizard route returns them clean. Same trap as
   legacy 2023; strip it on import.
@@ -238,6 +238,76 @@ never offered county at all (`sumlev` is only C/D/R/S).
 The new script detects this and reports it once per year rather than emitting
 33 identical failures.
 
+## A year convention that matters
+
+Everywhere in this repo, and in TEA's own parameters, the year is `ccyy` = the
+**spring** year = the end of the school year. TEA's own dropdown is explicit:
+
+```
+ccyy=2025  ->  school year 2024-25
+ccyy=2024  ->  school year 2023-24
+```
+
+So "2025" always means SY 2024-25, the most recent published TAPR.
+
+## SY 2024-25 assessment data: the data is fine, the Advanced route is not
+
+I first reported this as "2025 is partial", which was both vague and wrong about
+the cause. The corrected finding, verified dataset by dataset:
+
+**On the Advanced setpick route, every assessment dataset fails for SY 2024-25**
+(`ccyy=2025`), while every non-assessment dataset works:
+
+| dataset | SY 2023-24 (`ccyy=2024`) | SY 2024-25 (`ccyy=2025`) |
+|---|---|---|
+| STAAR1-6 | 842-1,892 cols | **all SAS error** |
+| PART1, PART2 | 1,376 / 602 cols | **both SAS error** |
+| STAAR_ADD1 | 1,514 cols | **SAS error** |
+| REF | 8 | 8 |
+| GRAD | 942 | 472 |
+| COMP | 1,346 | 674 |
+| PERF1 / PERF2 / PERF3 | 2,037 / 1,290 / 853 | 1,057 / 646 / 500 |
+| PROF | 420 | 385 |
+| KG | 1,900 | 1,900 |
+| PKEFF | 704 | 704 |
+
+(`PART1A`, `STAAR_ADD2`-`ADD5` and `OG` error in both years; they are retired
+codes, not a gap.)
+
+**The data itself is published and complete.** The wizard route returns SY
+2024-25 assessment data in full:
+
+```
+ccyy=2025 STAAR_ALL   3,370,041b   1,208 districts x 947 cols
+ccyy=2025 STAAR_GR3   2,127,758b   1,208 districts x 680 cols
+ccyy=2025 STUD        1,057,804b   1,208 districts x 242 cols
+```
+
+with real values (`001902, CAYUGA ISD, 839, 60, 660, 77, ...`).
+
+**Why the Advanced route fails.** It is not a data gap, it is a deprecated
+endpoint. The prgopt is literally `2024/tapr/Advanced Download/getdata_2024.sas`
+— a 2024 program reused for later years by varying `ccyy`. TEA never published a
+2025 Advanced download, TEA links the endpoint from no page at all, and the
+2024-25 TAPR index page points only at the wizard, describing it as "TAPR Data
+Download: Numerators, denominators, and rates in a delimited format". That
+description is the giveaway: the wizard's `var_type` N/D/R checkboxes *are* the
+numerator/denominator/rate option now. The separate Advanced download has been
+folded into the wizard, and the old route survives only far enough that the
+non-assessment datasets still resolve.
+
+**Practical consequence.** Use the setpick route through SY 2023-24 and the
+wizard from SY 2024-25 on. That is what `--route auto` now does. Expect the
+Advanced route to stop answering entirely at some point; it is unlinked,
+undocumented and already half-broken.
+
+**A caution about my own first pass.** Two of my early measurements here
+(a "227-byte, no data" response for SY 2024-25 STAAR) were throttling artifacts,
+not real results. Under load TEA returns short bodies and HTML that look exactly
+like "this year has no data". Any negative finding about data availability
+should be re-run slowly before you believe it. That is the same failure mode
+that made the original scraper look successful.
+
 ## Level availability, verified
 
 | level | 2013-2023 (legacy) | 2024-2025 (modern) |
@@ -331,6 +401,42 @@ columns, not a real value.
 release.
 
 ---
+
+## Integrity verification
+
+`--verify` exists because "it downloaded" proves nothing on this server. It
+re-downloads each dataset and checks structure rather than status codes. Run
+across district level for every year 2013-2025 (260 dataset-years):
+
+```
+rectangular: PASS      no ragged rows anywhere; nothing was truncated
+key capture: PASS      every `key` the page offered was submitted, counted
+                       independently of the HTML parser
+```
+
+Those two are the answer to "is anything being silently lost". Nothing is.
+
+Three real data characteristics did surface, all of which belong in the Stata
+import rather than in the downloader:
+
+- **Blank entity ids.** `PKEFF` 2022 has 76 district rows whose `DISTRICT`
+  value is a bare apostrophe; `PKEFF` 2023 has 27, `KG` 2021 and 2023 have one
+  each. Drop these rows on import.
+- **Entities outside the REF universe.** A few districts appear in `KG`
+  (11-18 per year), `PKEFF` (8-10) and `ACCLER` (1) but not in that year's
+  `REF`. Worth a look before assuming `REF` defines the universe.
+- **Column counts move a lot between years, for real reasons.** `STAAR1` at
+  district level runs 2,059 (2013), 673 (2015), 4,285 (2019), 1,892 (2024).
+  Part of that is TEA changing what it publishes; part is the prior-year
+  comparison columns, which double the width in some years and not others.
+  `PART1` alternating 211/421/211 is the same effect. None of it is truncation.
+
+One caution from building the checker: my first version picked the id column by
+taking the first of `CAMPUS`/`DISTRICT`/`REGION` **by position**. From 2021 TEA
+reordered the identifier block to `COUNTY, REGION, DISTRICT`, so it picked
+`REGION` and reported 1,184 "duplicate ids" and 65 spurious failures. Selecting
+by priority instead of position fixed it, and the run went from 65 failures to
+6. If a validator ever reports that every row is broken, suspect the validator.
 
 ## What the new script does
 

@@ -8,11 +8,19 @@ no API key, and no CAPTCHA on the interactive query path. This script maps that
 API so a full downloader can be written against it. See PORTAL.md for the
 narrative version.
 
-STATUS: the wizard walk, organization tree and query execution all work. The
-result table currently comes back empty (`noDataRows: true`), which is one
-unidentified field in the /Query/Run body. Use `--dump-body` to emit the exact
-request this script sends, then diff it against a real request captured from
-browser DevTools. See PORTAL.md §6.
+STATUS: WORKING at statewide, district and campus level, with CSV export.
+
+Two things were needed, both found by intercepting a real /Query/Run in the
+browser and diffing it against what this script was sending:
+
+  1. `fileImportIds` is REQUIRED (HTTP 400 without it) and is supplied by the
+     wizard walk itself. Build the run body FROM the walked selection object;
+     never assemble it field by field, or that field is silently dropped.
+
+  2. `selectedOrganizations` needs a DIFFERENT shape than /Organization/Query
+     returns. The API returns {id, name, ...}; /Query/Run wants
+     {organizationId, organizationName, entityExternalId, organizationLevelId}.
+     Passing the object through unchanged yields an empty table with no error.
 
 Do NOT automate the offline/email export path (/Query/Offline + /Query/Verify):
 it is gated by reCAPTCHA and email verification.
@@ -177,9 +185,27 @@ class PortalClient:
 
     # -- query execution ---------------------------------------------------
 
+    @staticmethod
+    def org_ref(o: dict) -> dict:
+        """Remap an /Organization/Query record into the shape /Query/Run wants.
+
+        This is not cosmetic. Passing the full record through returns an empty
+        table with HTTP 200 and no error message.
+        """
+        return {"organizationId": o["id"], "organizationName": o["name"],
+                "entityExternalId": o["entityExternalId"],
+                "organizationLevelId": o["organizationLevelId"]}
+
     def build_body(self, selection: dict, orgs: list[dict] | None = None,
-                   statewide: bool = False):
-        """Assemble a /Query/Run body.
+                   statewide: bool = False, breakdown: list | None = None):
+        """Assemble a /Query/Run body from a completed wizard walk.
+
+        Build this from the walked selection object, never field by field. The
+        walk is what supplies `fileImportIds`, `columnSet`, `asOfDate` and
+        `availableAspects`, and `fileImportIds` is REQUIRED -- the API returns
+        HTTP 400 "could not be converted" style errors without it. That single
+        field is why hand-assembled bodies executed cleanly and returned
+        nothing.
 
         Any stale `queryHash` must be stripped: re-running a body that still
         carries one makes the job report Errored.
@@ -188,42 +214,51 @@ class PortalClient:
         body = {k: v for k, v in selection.items() if k != "queryHash"}
         body.update({
             "organizationIds": [o["id"] for o in orgs],   # Int64, not the GUID
-            "selectedOrganizations": orgs,
+            "selectedOrganizations": [self.org_ref(o) for o in orgs],
             "stateFlag": bool(statewide),
             "queryProcessEngine": "ReportAsync",
+            "aspect": "Default",
             "drillDownStack": [],
             "dynamicFilter": [],
-            "dynamicBreakdown": [],
+            "dynamicBreakdown": breakdown or [],
             "bypassDefaultColumnVisibility": False,
-            "bypassStateSelection": False,
         })
         return body
 
-    def run(self, body: dict, poll_every: float = 3.0, max_polls: int = 40):
+    def run(self, body: dict, poll_every: float = 3.0, max_polls: int = 30,
+            attempts: int = 6):
         """POST /Query/Run, poll if queued, return the ready payload.
 
         202 means queued and carries request.queryHash; poll /Query/Status
         (queryHash goes in the QUERY STRING, not the body) until Finished, then
         re-POST /Query/Run to collect the result.
+
+        The retry loop is not decoration: a freshly computed query can answer
+        200 with an empty table before the result is actually available, and
+        succeed on a later attempt. HOUSTON ISD needed two. A single try will
+        silently under-report.
         """
-        status, d = self._json("/Query/Run", body, "POST")
-        if status == 200:
-            return d
-        if status != 202:
-            raise RuntimeError(f"/Query/Run failed: {status} {d}")
-        qh = d["request"]["queryHash"]
-        for _ in range(max_polls):
-            time.sleep(poll_every)
-            _, s = self._json(
-                "/Query/Status?queryHash=" + urllib.parse.quote(qh), None, "POST")
-            state = s.get("status") if isinstance(s, dict) else None
-            if state == "Errored":
-                raise RuntimeError(f"query errored: {json.dumps(s)[:300]}")
-            if state == "Finished":
-                break
-        else:
-            raise TimeoutError(f"query did not finish: {qh}")
-        status, d = self._json("/Query/Run", body, "POST")
+        for attempt in range(attempts):
+            status, d = self._json("/Query/Run", body, "POST")
+            if status == 202:
+                qh = d["request"]["queryHash"]
+                for _ in range(max_polls):
+                    time.sleep(poll_every)
+                    _, s = self._json(
+                        "/Query/Status?queryHash=" + urllib.parse.quote(qh),
+                        None, "POST")
+                    state = s.get("status") if isinstance(s, dict) else None
+                    if state == "Errored":
+                        raise RuntimeError(f"query errored: {json.dumps(s)[:300]}")
+                    if state == "Finished":
+                        break
+                continue
+            if status != 200:
+                raise RuntimeError(f"/Query/Run failed: {status} {d}")
+            table = (d.get("tables") or [{}])[0]
+            if table.get("rows"):
+                return d
+            time.sleep(poll_every + 2)
         return d
 
     def download_csv(self, body: dict) -> bytes:
@@ -235,13 +270,15 @@ class PortalClient:
 
 # --------------------------------------------------------------------------
 
+# "Group Summary: Performance Levels & Reporting Categories" is the report the
+# portal UI itself runs, and the one verified to return data. Note its wizard
+# has 5 steps (no `versions`), where "Standard Summary" has 6.
 DEFAULT_PICKS = {
     "assessment": "STAAR 3-8",
-    "report": "Standard Summary",
+    "report": "Group Summary: Performance Levels & Reporting Categories",
     "administrations": "Spring 2024",
     "subjects": "Mathematics",
-    "versions": "STAAR All",
-    "grades": "Grade 5",
+    "grades": "Grade 3",
 }
 
 
@@ -286,7 +323,12 @@ def cmd_query(c: PortalClient, args):
     selection = c.walk(picks)
 
     orgs = []
-    if args.district or args.campus:
+    if args.all_districts or args.all_campuses:
+        level = "district" if args.all_districts else "campus"
+        orgs = c.organizations(level)[:args.batch]
+        print(f"\n{len(orgs)} {level}s in one request "
+              f"(batching is both faster and avoids the single-org quirk)")
+    elif args.district or args.campus:
         tea_id = args.district or args.campus
         level = "district" if args.district else "campus"
         found = c.organizations(level, search=None, max_pages=None)
@@ -340,6 +382,12 @@ def main(argv=None):
     p.add_argument("--district", help="district by 6-digit TEA CDN, e.g. 227901")
     p.add_argument("--campus", help="campus by 9-digit TEA id")
     p.add_argument("--statewide", action="store_true")
+    p.add_argument("--all-districts", action="store_true",
+                   help="query many districts in one request (recommended)")
+    p.add_argument("--all-campuses", action="store_true",
+                   help="query many campuses in one request")
+    p.add_argument("--batch", type=int, default=50,
+                   help="organizations per request (default 50)")
     p.add_argument("--assessment"), p.add_argument("--report")
     p.add_argument("--admin", help='administration, e.g. "Spring 2024"')
     p.add_argument("--subjects"), p.add_argument("--versions"), p.add_argument("--grades")

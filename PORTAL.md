@@ -5,11 +5,8 @@ than anything else surveyed.** It is a public JSON API with no authentication,
 no API key, and no CAPTCHA on the query path. I mapped the whole surface and
 verified it live on 2026-08-03.
 
-One caveat stated up front: I got the query to run cleanly end to end, but the
-result table came back empty every time. Everything up to that point works. The
-remaining gap is one unidentified field in the run body, and §6 says exactly how
-to close it in about fifteen minutes. **Do not treat this as a finished
-downloader.**
+**Status: working at statewide, district and campus level, with CSV export.**
+§6 records the two non-obvious things that were blocking it.
 
 ---
 
@@ -167,25 +164,89 @@ Errors are informative if you read them properly:
 - **Reusing a body that still contains an old `queryHash` makes the run report
   `Errored`.** Strip it before re-running with different selections.
 
-## 6. The one unresolved piece
+## 6. What was blocking it
 
-Every request above returns `200` with `isError: false`, and `/Query/Status`
-reports `Finished` — but `tables[0]` comes back as
-`{"noDataRows": true, "columns": [], "rows": []}`, and `/Query/Download` returns
-a 2-byte CSV. That held for statewide and for Austin ISD, with and without
-`aspect`, `noCache`, `subjects`, and both `Report` and `ReportAsync` engines.
+Both blockers were found the same way: drive the portal UI in a browser,
+intercept the real `/Query/Run`, and diff it against what the script sends.
+Neither produces an error message; both return HTTP 200 with an empty table.
 
-This is a missing or mis-shaped field in the run body, not a permissions or
-masking problem: masking would suppress cells, not drop the column definitions.
+### Blocker 1: `fileImportIds`
 
-**How to close it, quickly.** Open <https://txresearchportal.com> in a browser,
-run one small report through the UI by hand, and in DevTools → Network copy the
-`/Query/Run` request as cURL. Diff that body against `goodbody.json` from my
-session. The delta is the answer, and the sensible move is to stop reverse
-engineering and read one real request. Likely candidates, in order: a populated
-`subjects` array (the server echoed `{"assessmentSubjectId": 827, ...}` back in
-its own response), a non-empty `columnVisibility`, or an `aspect` object rather
-than the string I tried.
+The app's body carried five fields mine did not: `fileImportIds`, `columnSet`,
+`asOfDate`, `availableAspects`, `lastStepNumber`. An ablation test isolates the
+one that matters:
+
+| removed from a working body | result |
+|---|---|
+| `lastStepNumber` | still works |
+| `aspect` | still works |
+| `columnSet` | still works |
+| **`fileImportIds`** | **HTTP 400** |
+
+`fileImportIds` identifies the data import, it is required, and **the wizard
+walk already returns it**. `GET /QuerySelection/{clientId}` starts with
+`fileImportIds: []` and the server fills it in as steps are selected.
+
+**Rule: never hand-assemble a run body.** Walk the wizard, take the object it
+returns, strip `queryHash`, and add only the execution fields.
+
+### Blocker 2: the `selectedOrganizations` shape
+
+`/Organization/Query` returns records shaped like:
+
+```json
+{"id": 127907, "name": "ABILENE ISD", "organizationLevelId": 2,
+ "entityKey": "...", "entityExternalId": "221901", "parent": {...}, ...}
+```
+
+`/Query/Run` will not accept that. It wants a four-field projection with
+**different key names**:
+
+```json
+{"organizationId": 127907, "organizationName": "ABILENE ISD",
+ "entityExternalId": "221901", "organizationLevelId": 2}
+```
+
+Pass the record through unchanged and you get HTTP 200, `isError: false`,
+`noDataRows: true`, and a 2-byte CSV. No error, no hint. `PortalClient.org_ref()`
+does the remap.
+
+### A quirk to design around: batch your organizations
+
+Single-organization queries are unreliable. `HOUSTON ISD` alone needed a second
+attempt; `AUSTIN ISD` alone returns nothing across six attempts and both cache
+settings, yet returns data immediately when paired with any other district. The
+UI reproduces this: `ABBOTT ISD` alone showed "There is no data available for
+this query", then showed 21 tests once a second district was added.
+
+Batching is the fix, and it is the right design regardless — one request for
+many organizations rather than 1,314 requests. Verified:
+
+```
+50 districts in one request  -> 45 data rows
+50 campuses  in one request  -> 12 data rows   (most campuses have no grade 3)
+```
+
+Output carries the TEA identifier directly in an `ID/CDC` column:
+
+```
+"A+ ACADEMY","057829","Spring 2024","3","105","1402",...
+"A B DUNCAN COLLEGIATE EL","077901101","Spring 2024","3","42","1453",...
+```
+
+6-digit CDN for districts, 9-digit campus id for campuses. No crosswalk needed.
+
+The `run()` retry loop is also load-bearing: a freshly computed query can answer
+200 with an empty table before the result is really available. A single attempt
+silently under-reports.
+
+### Verified working
+
+```
+python3 portal_probe.py --query --statewide
+python3 portal_probe.py --query --all-districts --batch 25
+python3 portal_probe.py --query --all-campuses  --batch 25
+```
 
 ## 7. Suggested module design
 

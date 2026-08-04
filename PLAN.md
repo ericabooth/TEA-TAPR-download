@@ -21,13 +21,16 @@ TAPR files cannot simply be appended. Four things change across years:
 3. **Variables appear, disappear and move position.** `DAD_POST` is present
    2014-2019 and 2022, absent 2020-2021 and 2023. `DISTRICT` is column 1 in
    most years and column 3 in 2021-2023.
-4. **The file format changes at the 2024 boundary — but this one is avoidable.**
-   The wizard route serves 2024-2025 with two header rows and different dataset
-   codes. The Advanced setpick route serves the same years with the *legacy*
-   schema: one header row, full N/D/R, same year-embedded names. Use the
-   setpick route (the downloader's default) and 2013-2024 share one format.
-   2022 still ships mixed-case names, and 2023 IDs still carry a leading
-   apostrophe, as do 2024-2025 IDs on the Advanced route.
+4. **The file format changes, and the break is later than it first appears.**
+   The Advanced setpick route extends the legacy schema (one header row, full
+   N/D/R, year-embedded names) through **SY 2023-24**, so 2013 through 2023-24
+   share one format. From **SY 2024-25** the wizard is the only route with
+   assessment data, and it brings two header rows and different dataset codes.
+   Separately, 2022 ships mixed-case names, and IDs carry a leading apostrophe
+   in 2023 and on the Advanced route in 2023-24 and 2024-25.
+
+   A note on year notation: `ccyy` is the **spring** year throughout, so
+   `ccyy=2025` means school year 2024-25.
 
 The good news: (1) is fully mechanical, and it is the bulk of the problem.
 
@@ -259,11 +262,14 @@ Carry these as a documented `comparable` flag on `varmeta`, and as a
   comparisons of STAAR performance through 2023 are not valid without
   explicit caveat. Also: no accountability ratings in `REF`, and the leading
   apostrophe on IDs.
-- **2024-2025**: route change. On the Advanced setpick route the schema stays
-  continuous with 2013-2023; on the wizard route you get two-row headers,
-  different dataset codes and `REGNNAME`. 2025 STAAR is not served by the
-  Advanced route, so STAAR for 2025 has to come from the wizard — the one place
-  the panel genuinely has to switch routes mid-series. Flag it.
+- **SY 2023-24**: still reachable on the setpick route, so the schema stays
+  continuous with 2013 onward.
+- **SY 2024-25**: the panel must switch routes. The Advanced setpick route has
+  no assessment data for this year (every STAAR/PART dataset errors), while the
+  wizard serves it in full. Crossing that boundary means two header rows,
+  different dataset codes, `REGNNAME` appearing, and clean IDs instead of
+  apostrophe-prefixed ones. This is the single most disruptive seam in the
+  panel — flag every variable that crosses it.
 - **2013-2014**: TAKS still being phased out (`TAKS1`, `TAKS2` datasets).
 - **Student-group definitions** shift over the period, notably the
   emergent-bilingual / English-learner terminology change and revisions to

@@ -18,8 +18,10 @@ knew about one of them:
                      Carries the legacy schema forward: one header row, full
                      N/D/R, same year-embedded names (DDA03ARE1024D). This is
                      what lets 2013-2024 be appended without a format break.
-                     Undocumented - TEA links it from no page. 2025 is partial
-                     (STAAR1 errors; REF/PROF/KG/GRAD/COMP/PERF1 work).
+                     Undocumented - TEA links it from no page. For SY 2024-25
+                     (ccyy=2025) EVERY assessment dataset errors while the
+                     non-assessment ones still work, so `auto` routes that year
+                     to the wizard.
 
   WIZARD             (2024-)      multi-step POST
                      prgopt=reports/tapr/dd/dd_tapr.sas
@@ -61,9 +63,13 @@ Bugs fixed relative to the original:
 
   7. No resume, and a success counter that incremented on failure.
 
+Note on years: `--years` takes TEA's `ccyy`, the SPRING year, so 2025 means
+school year 2024-25.
+
 Usage:
     python3 tapr_download.py --years 2013-2025 --levels C D
     python3 tapr_download.py --route wizard --years 2024-2025 --datasets STAAR_ALL
+    python3 tapr_download.py --verify --years 2013-2025 --levels D  # integrity
     python3 tapr_download.py --audit-years 2013-2025    # variable inventory only
 """
 
@@ -99,13 +105,26 @@ MODERN_FROM = 2024
 # so treat it as undocumented and verify it still answers before a long run.
 ADVANCED_PRGOPT = "2024/tapr/Advanced Download/getdata_2024.sas"
 
-# No HTML page exposes the 2024-2025 setpick list, so we probe this candidate
-# set (the 2023 list plus the 2024-era additions) and record what answers.
+# Last year the Advanced route serves completely. It is a 2024 SAS program being
+# reused for later years via ccyy, and for ccyy=2025 (SY 2024-25) EVERY
+# assessment dataset errors -- STAAR1-6, PART1, PART1A, PART2, STAAR_ADD1-5 --
+# while REF/GRAD/COMP/PERF1-3/PROF/KG/PKEFF still answer. The data itself is
+# published: the wizard returns SY 2024-25 STAAR_ALL at 1,208 districts x 947
+# columns. So beyond this year the wizard is the only complete route.
+ADVANCED_THROUGH = 2024
+
+# No HTML page exposes the 2024+ setpick list, so we probe the FULL UNION of
+# every code TEA has ever offered on its own 2013-2023 pages (31 codes) and
+# record which answer. Probing a hand-written subset was a real integrity hole:
+# an earlier version of this list omitted ACCLER, OC, PARTV, PERF, STAARV,
+# TAKS1 and TAKS2, any of which TEA could serve without us ever asking.
+# Codes that do not exist for a year cost one cheap 160-byte error each.
 ADVANCED_CANDIDATES = [
     "REF", "STAAR1", "STAAR2", "STAAR3", "STAAR4", "STAAR5", "STAAR6",
-    "PART1", "PART1A", "PART2", "STAAR_ADD1", "STAAR_ADD2", "STAAR_ADD3",
-    "STAAR_ADD4", "STAAR_ADD5", "GRAD", "COMP", "PERF1", "PERF2", "PERF3",
-    "PROF", "KG", "PKEFF", "OG",
+    "STAARV", "STAAR_ADD1", "STAAR_ADD2", "STAAR_ADD3", "STAAR_ADD4",
+    "STAAR_ADD5", "PART1", "PART1A", "PART2", "PARTV", "ACCLER",
+    "TAKS1", "TAKS2", "GRAD", "COMP", "PERF", "PERF1", "PERF2", "PERF3",
+    "PROF", "KG", "PKEFF", "OC", "OG",
 ]
 
 # Canonical level codes used by this tool, mapped onto each endpoint's spelling.
@@ -535,8 +554,7 @@ class TaprDownloader:
         codes like STAAR1/PERF1, the wizard uses STAAR_ALL/STUD. Route choice
         therefore changes which `--datasets` values are valid.
         """
-        if self.route == "wizard" or (self.route == "auto" and year >= MODERN_FROM
-                                      and self.prefer_wizard):
+        if self._endpoint_for(year) == "wizard":
             cats, hidden = self.modern_datasets(year, level)
             return [(c["value"], c["label"], hidden) for c in cats]
         if LEVELS[level][2] is None:
@@ -547,8 +565,17 @@ class TaprDownloader:
         return [(sp, "", None) for sp in form["setpick"]]
 
     def _endpoint_for(self, year):
-        if self.route == "wizard" or (self.route == "auto" and year >= MODERN_FROM
-                                      and self.prefer_wizard):
+        """Pick a route.
+
+        auto: setpick through ADVANCED_THROUGH (one schema, appendable), then
+        the wizard, because the Advanced route has no assessment data past that
+        year. `--route setpick` forces the setpick route even where it is
+        incomplete, which is useful for the non-assessment datasets that do
+        continue.
+        """
+        if self.route == "wizard":
+            return "wizard"
+        if self.route == "auto" and year > ADVANCED_THROUGH:
             return "wizard"
         return "advanced" if year >= MODERN_FROM else "legacy"
 
@@ -598,6 +625,246 @@ class TaprDownloader:
                 d = asdict(r)
                 d["var_types"] = "|".join(r.var_types)
                 w.writerow([d[c] for c in cols])
+
+    # -- integrity verification -------------------------------------------
+
+    def verify(self, years, levels, datasets=None):
+        """Prove the extracts are complete and rectangular, and print receipts.
+
+        The failure mode this exists to catch is silent truncation. TEA answers
+        every failure with HTTP 200, and the original scraper's headline bug
+        (omitting `var_type`) produced files that opened fine, parsed fine, and
+        contained no data. So "it downloaded" is not evidence of anything.
+
+        Checks per (year, level, dataset):
+
+          rectangular   every data row has exactly as many fields as the header
+          complete      the parser asked for every `key` the page offered, and
+                        every `var_type`; counted independently of the parser
+          populated     more than the identifier columns came back
+          unique        no duplicate entity ids
+          covered       entity ids reconcile against that year's REF universe
+
+        `covered` is reported, not enforced: a district with no grade 12
+        legitimately has no GRAD row. Under-coverage is a prompt to look, not a
+        defect on its own.
+        """
+        import collections
+        rows, universe = [], {}
+
+        for year in years:
+            for level in levels:
+                try:
+                    avail = self.datasets_for(year, level)
+                except Exception as e:  # noqa: BLE001
+                    print(f"{year} {level}: cannot enumerate: {e}", flush=True)
+                    continue
+                if datasets:
+                    want = {d.upper() for d in datasets}
+                    avail = [a for a in avail if a[0].upper() in want]
+                if not avail:
+                    continue
+                # REF first: it defines the entity universe for the year.
+                avail.sort(key=lambda a: a[0].upper() != "REF")
+                endpoint = self._endpoint_for(year)
+                print(f"\n=== {year} / {LEVELS[level][0]} ({endpoint}) ===", flush=True)
+
+                for code, _label, hidden in avail:
+                    rec = {"year": year, "level": level, "dataset": code,
+                           "endpoint": endpoint, "status": "", "n_rows": 0,
+                           "n_cols": 0, "keys_offered": 0, "keys_sent": 0,
+                           "var_types": "", "ragged_rows": 0, "dup_ids": 0,
+                           "blank_ids": 0,
+                           "ids_in_ref": 0, "ids_not_in_ref": 0,
+                           "ref_universe": 0, "coverage_pct": "", "bytes": 0,
+                           "note": ""}
+                    try:
+                        if endpoint == "wizard":
+                            content, keys_off, keys_sent, vts = self._wizard_verified(
+                                year, level, code, hidden or {})
+                            rec["keys_offered"], rec["keys_sent"] = keys_off, keys_sent
+                            rec["var_types"] = "|".join(vts)
+                        else:
+                            content, _, _, vts = self.legacy_download(year, level, code)
+                        rec["bytes"] = len(content)
+
+                        ok, nr, nc, nh, msg = self.validate(
+                            content, endpoint,
+                            expect_data=bool(rec["var_types"]))
+                        rec["n_rows"], rec["n_cols"] = nr, nc
+                        if not ok:
+                            rec["status"] = "ABSENT" if "SAS broker error" in msg else "BAD"
+                            rec["note"] = msg
+                            rows.append(rec)
+                            self._print_receipt(rec)
+                            self._pause()
+                            continue
+
+                        parsed = [r for r in csv.reader(
+                            io.StringIO(content.decode("latin-1")))
+                            if r and any(c.strip() for c in r)]
+                        names, data = parsed[nh - 1], parsed[nh:]
+                        rec["ragged_rows"] = sum(1 for r in data if len(r) != len(names))
+
+                        # Pick the id column by PRIORITY, not by position. From
+                        # 2021 TEA reordered the identifier block to
+                        # COUNTY, REGION, DISTRICT..., so taking the first
+                        # match picks REGION and every district then looks like
+                        # a duplicate. Ask for the finest available grain.
+                        upper = [n.strip().upper() for n in names]
+                        idx = next((upper.index(w) for w in
+                                    ("CAMPUS", "DISTRICT", "REGION", "SUMLEV")
+                                    if w in upper), None)
+                        if idx is not None:
+                            raw = [r[idx].strip().lstrip("'") for r in data
+                                   if len(r) > idx]
+                            # PKEFF and KG carry rows whose id column is blank
+                            # (TEA writes a bare apostrophe). Count those
+                            # separately: they are rows to drop on import, not
+                            # genuine duplicate entities.
+                            rec["blank_ids"] = sum(1 for v in raw if not v)
+                            ids = [v for v in raw if v]
+                            c = collections.Counter(ids)
+                            rec["dup_ids"] = sum(v - 1 for v in c.values() if v > 1)
+                            key = (year, level)
+                            if code.upper() == "REF":
+                                universe[key] = set(ids)
+                            uni = universe.get(key)
+                            if uni:
+                                s = set(ids)
+                                rec["ref_universe"] = len(uni)
+                                rec["ids_in_ref"] = len(s & uni)
+                                rec["ids_not_in_ref"] = len(s - uni)
+                                rec["coverage_pct"] = f"{100*len(s & uni)/len(uni):.1f}"
+
+                        problems = []
+                        if rec["ragged_rows"]:
+                            problems.append(f"{rec['ragged_rows']} ragged rows")
+                        if rec["dup_ids"]:
+                            problems.append(f"{rec['dup_ids']} duplicate ids")
+                        if rec["blank_ids"]:
+                            problems.append(f"{rec['blank_ids']} blank ids")
+                        if rec["ids_not_in_ref"]:
+                            problems.append(f"{rec['ids_not_in_ref']} ids not in REF")
+                        if rec["keys_offered"] and rec["keys_sent"] != rec["keys_offered"]:
+                            problems.append(
+                                f"sent {rec['keys_sent']}/{rec['keys_offered']} keys")
+                        rec["status"] = "FAIL" if problems else "OK"
+                        rec["note"] = "; ".join(problems)
+                    except Exception as e:  # noqa: BLE001
+                        rec["status"] = "ERROR"
+                        rec["note"] = f"{type(e).__name__}: {e}"
+                    rows.append(rec)
+                    self._print_receipt(rec)
+                    self._pause()
+
+        self._write_receipts(rows)
+        return rows
+
+    def _wizard_verified(self, year, level, dsname, step2_hidden):
+        """Wizard download that counts offered controls independently.
+
+        The point is to catch a parser that silently drops controls. `keys_off`
+        comes from a raw regex over the HTML, `keys_sent` from the HTML parser
+        the downloader actually uses. If they disagree, the parser is losing
+        columns and every file it produced is short.
+        """
+        data = dict(step2_hidden)
+        data.update({"dsname": dsname, "step": "3"})
+        r = self._req("POST", BROKER, data=data)
+        keys_off = len(re.findall(r"<input[^>]+name=['\"]key['\"]", r.text, re.I))
+        vts_off = len(re.findall(r"<input[^>]+name=['\"]var_type['\"]", r.text, re.I))
+
+        fp = FormParser(); fp.feed(r.text)
+        keys = [v for n, v, _ in fp.checkboxes if n == "key"]
+        var_types = [v for n, v, _ in fp.checkboxes if n == "var_type"]
+        if len(var_types) != vts_off:
+            raise RuntimeError(f"var_type parse mismatch: {len(var_types)} vs {vts_off}")
+        fmts = fp.selects.get("datafmt", ["csv"])
+        action = fp.form_action or "/cgi/sas/broker/"
+
+        post = [(k, v) for k, v in fp.hidden.items()]
+        post += [("key", k) for k in keys]
+        post += [("var_type", v) for v in var_types]
+        post.append(("datafmt", "csv" if "csv" in fmts else fmts[0]))
+        self._pause(0.5)
+        r2 = self._req("POST", requests.compat.urljoin(BROKER, action), data=post)
+        return r2.content, keys_off, len(keys), var_types
+
+    @staticmethod
+    def _print_receipt(rec):
+        mark = {"OK": "OK", "ABSENT": "--", "BAD": "!!", "FAIL": "!!",
+                "ERROR": "XX"}.get(rec["status"], "??")
+        if rec["status"] == "OK":
+            cov = f"cov {rec['coverage_pct']}%" if rec["coverage_pct"] else ""
+            keys = (f"keys {rec['keys_sent']}/{rec['keys_offered']}"
+                    if rec["keys_offered"] else "")
+            vt = f"vt {rec['var_types']}" if rec["var_types"] else ""
+            print(f"  [{mark}] {rec['dataset']:<12} {rec['n_rows']:>7,} x "
+                  f"{rec['n_cols']:>5,}  {rec['bytes']/1e6:>7.2f} MB  "
+                  f"{keys:<12} {vt:<10} {cov}", flush=True)
+        else:
+            print(f"  [{mark}] {rec['dataset']:<12} {rec['note'][:78]}", flush=True)
+
+    def _write_receipts(self, rows):
+        """Write the machine-readable report and print the year x dataset grid."""
+        import collections
+        dest = self.out / "integrity_report.csv"
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        cols = ["year", "level", "dataset", "endpoint", "status", "n_rows", "n_cols",
+                "keys_offered", "keys_sent", "var_types", "ragged_rows", "dup_ids",
+                "blank_ids",
+                "ref_universe", "ids_in_ref", "ids_not_in_ref", "coverage_pct",
+                "bytes", "note"]
+        with open(dest, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=cols)
+            w.writeheader()
+            for r in rows:
+                w.writerow({c: r.get(c, "") for c in cols})
+
+        for level in sorted({r["level"] for r in rows}):
+            sub = [r for r in rows if r["level"] == level]
+            years = sorted({r["year"] for r in sub})
+            dsets = sorted({r["dataset"] for r in sub})
+            grid = {(r["year"], r["dataset"]): r for r in sub}
+            print(f"\n{'='*(16 + 8*len(years))}")
+            print(f"RECEIPTS - {LEVELS[level][0]}: columns returned per dataset x year")
+            print(f"{'='*(16 + 8*len(years))}")
+            print(f"{'dataset':<14}" + "".join(f"{y%100:>8}" for y in years))
+            for d in dsets:
+                cells = []
+                for y in years:
+                    r = grid.get((y, d))
+                    if r is None:
+                        cells.append("     ...")
+                    elif r["status"] == "OK":
+                        cells.append(f"{r['n_cols']:>8,}")
+                    elif r["status"] == "ABSENT":
+                        cells.append("       -")
+                    else:
+                        cells.append("    FAIL")
+                print(f"{d:<14}" + "".join(cells))
+            print(f"\n{'rows':<14}" + "".join(
+                f"{(grid.get((y,'REF')) or {}).get('n_rows',0):>8,}" for y in years)
+                + "   <- REF entity universe")
+
+            c = collections.Counter(r["status"] for r in sub)
+            print(f"\n  {LEVELS[level][0]}: " + "  ".join(
+                f"{k}={v}" for k, v in sorted(c.items())))
+            bad = [r for r in sub if r["status"] in ("FAIL", "BAD", "ERROR")]
+            if bad:
+                print(f"  {len(bad)} needing attention:")
+                for r in bad:
+                    print(f"    {r['year']} {r['dataset']:<12} {r['status']}: {r['note'][:64]}")
+            ragged = sum(r["ragged_rows"] for r in sub)
+            dups = sum(r["dup_ids"] for r in sub)
+            blanks = sum(r.get("blank_ids", 0) for r in sub)
+            short = [r for r in sub if r["keys_offered"] and r["keys_sent"] != r["keys_offered"]]
+            print(f"\n  rectangular: {'PASS' if ragged == 0 else f'FAIL ({ragged} ragged rows)'}")
+            print(f"  unique ids : {'PASS' if dups == 0 else f'FAIL ({dups} duplicates)'}")
+            print(f"  non-blank  : {'PASS' if blanks == 0 else f'{blanks} rows with a blank id (drop on import)'}")
+            print(f"  key capture: {'PASS' if not short else f'FAIL ({len(short)} short)'}")
+        print(f"\nwrote {dest}")
 
     def audit(self, years, levels, datasets=None):
         """Emit a varname x year inventory without keeping the data.
@@ -694,6 +961,9 @@ def main(argv=None):
     ap.add_argument("--force", action="store_true")
     ap.add_argument("--audit-years", default=None,
                     help="write variable_inventory.csv for these years and exit")
+    ap.add_argument("--verify", action="store_true",
+                    help="integrity check: prove extracts are complete and "
+                         "rectangular, print receipts, write integrity_report.csv")
     ap.add_argument("--route", choices=["auto", "setpick", "wizard"], default="auto",
                     help="auto/setpick use the Advanced setpick route for every "
                          "year (one header row, N/D/R, appendable 2013-2024); "
@@ -709,6 +979,11 @@ def main(argv=None):
         dl.audit(parse_years(a.audit_years), a.levels, a.datasets)
         return 0
     years = parse_years(a.years)
+    if a.verify:
+        print(f"Integrity check: {years[0]}-{years[-1]}, "
+              f"{', '.join(LEVELS[l][0] for l in a.levels)}\n")
+        dl.verify(years, a.levels, a.datasets)
+        return 0
     print(f"TEA TAPR downloader\n  years:    {years[0]}-{years[-1]} ({len(years)})"
           f"\n  levels:   {', '.join(LEVELS[l][0] for l in a.levels)}"
           f"\n  datasets: {a.datasets or 'all'}\n  output:   {a.output}")
