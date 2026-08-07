@@ -44,9 +44,25 @@ DDA03ARE1019D  ->  DDA03ARE10@D
 DDA03ARE1023D  ->  DDA03ARE10@D
 ```
 
-Verified: **1,890 of 1,892** stems in the 2023 district STAAR1 file match 2019
-stems exactly. This one rule harmonises the large majority of TAPR variables
-without any hand-maintained mapping.
+Verified two ways. Pairwise: **1,890 of 1,892** stems in the 2023 district
+STAAR1 file match 2019 stems exactly. And across the whole downloaded subset,
+`build_codebook.do` measures how far the rule actually gets, per dataset
+(`stata_docs/stem_rule.csv`):
+
+| dataset | distinct names, 2013-2024 | distinct stems | names carrying a year | collapse |
+|---|---|---|---|---|
+| STAAR1 | 19,434 | 2,486 | 99.99% | **87.2%** |
+| PROF | 818 | 479 | 43.9% | 41.4% |
+| REF | 13 | 13 | 0% | 0% |
+
+Read that carefully, because it changes the work estimate. The stem rule is
+**decisive for the STAAR firehose** -- essentially every name carries a
+parseable year, and 19,434 names collapse to 2,486 measures. It does about
+**half the job for PROF**, where only 44% of names embed a year. And it is
+**irrelevant for REF**, which has no year-embedded names at all.
+
+So: assume the stem rule for STAAR, budget a real crosswalk for PROF-style
+profile datasets, and treat REF as already stable.
 
 Two things to watch:
 
@@ -59,10 +75,15 @@ Two things to watch:
 
 ### The rest
 
-Everything the stem rule does not cover goes into a small, hand-maintained
-crosswalk keyed on `varname x year`. Based on the district `REF` audit, this is
-on the order of tens of entries, not thousands — things like `SECS` (2013
-only), `OC` becoming `OG` in 2021, `PERF` splitting into `PERF1/2/3`.
+Everything the stem rule does not cover goes into a hand-maintained crosswalk
+keyed on `varname x year`. For `REF` that really is tens of entries. For `PROF`
+it is larger: of 984 apparent add/drop events across 2013-2024, the stem rule
+explains 644, leaving **340 genuine additions and removals** to map by hand.
+
+`build_codebook.do` writes the exact list to
+`stata_docs/codebook_PROF_D.xlsx` (the `Changes` sheet) and
+`stata_docs/variable_presence.csv`, so the crosswalk starts from evidence
+rather than from a blank page.
 
 ---
 

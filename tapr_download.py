@@ -613,258 +613,219 @@ class TaprDownloader:
     # -- outputs -----------------------------------------------------------
 
     def manifest(self):
-        (self.out / "manifest.json").write_text(
-            json.dumps([asdict(r) for r in self.results], indent=1))
+        """Write the manifest, MERGING with whatever previous runs recorded.
+
+        Runs are incremental (different years, levels or datasets each time), so
+        overwriting would throw away the checksums and dimensions of everything
+        downloaded earlier and leave `--check` unable to verify most of the
+        archive. Keyed on (year, level, dataset); the current run wins.
+        """
+        man = self.out / "manifest.json"
+        merged = {}
+        if man.exists():
+            try:
+                for r in json.loads(man.read_text()):
+                    merged[(r.get("year"), r.get("level"), r.get("dataset"))] = r
+            except Exception:  # noqa: BLE001
+                pass
+        for r in self.results:
+            d = asdict(r)
+            # A skip carries no fresh checksum; keep the richer earlier record.
+            key = (d["year"], d["level"], d["dataset"])
+            if d["status"] == "skipped" and key in merged:
+                continue
+            merged[key] = d
+        rows = [merged[k] for k in sorted(merged, key=lambda k: (k[0], k[1], k[2]))]
+        man.write_text(json.dumps(rows, indent=1))
+
+        cols = ["year", "level", "level_name", "dataset", "endpoint", "label",
+                "status", "path", "tea_filename", "bytes", "sha256", "n_rows",
+                "n_cols", "n_header_rows", "n_keys", "var_types", "message"]
         with open(self.out / "manifest.csv", "w", newline="") as f:
             w = csv.writer(f)
-            cols = ["year", "level", "level_name", "dataset", "endpoint", "label",
-                    "status", "path", "tea_filename", "bytes", "sha256", "n_rows",
-                    "n_cols", "n_header_rows", "n_keys", "var_types", "message"]
             w.writerow(cols)
-            for r in self.results:
-                d = asdict(r)
-                d["var_types"] = "|".join(r.var_types)
-                w.writerow([d[c] for c in cols])
+            for d in rows:
+                d = dict(d)
+                if isinstance(d.get("var_types"), list):
+                    d["var_types"] = "|".join(d["var_types"])
+                w.writerow([d.get(c, "") for c in cols])
 
-    # -- integrity verification -------------------------------------------
+    def check_downloads(self, backfill=False):
+        """Verify files already on disk, without re-downloading anything.
 
-    def verify(self, years, levels, datasets=None):
-        """Prove the extracts are complete and rectangular, and print receipts.
+        `--verify` proves the extracts are complete as they come off the wire.
+        This proves they are still intact afterwards: gzip decodes, the CSV
+        parses, every row matches the header width, and the SHA-256 matches the
+        manifest. Run it after a long download, or before trusting an archive
+        you did not create in this session.
 
-        The failure mode this exists to catch is silent truncation. TEA answers
-        every failure with HTTP 200, and the original scraper's headline bug
-        (omitting `var_type`) produced files that opened fine, parsed fine, and
-        contained no data. So "it downloaded" is not evidence of anything.
-
-        Checks per (year, level, dataset):
-
-          rectangular   every data row has exactly as many fields as the header
-          complete      the parser asked for every `key` the page offered, and
-                        every `var_type`; counted independently of the parser
-          populated     more than the identifier columns came back
-          unique        no duplicate entity ids
-          covered       entity ids reconcile against that year's REF universe
-
-        `covered` is reported, not enforced: a district with no grade 12
-        legitimately has no GRAD row. Under-coverage is a prompt to look, not a
-        defect on its own.
+        `backfill=True` additionally writes a manifest record (with SHA-256)
+        for every file that passes the structural checks but has no recorded
+        checksum -- the repair for archives downloaded before the manifest
+        learned to merge instead of overwrite. A backfilled checksum describes
+        the file as it is on disk today, not the bytes TEA originally sent;
+        the record says so.
         """
         import collections
-        rows, universe = [], {}
+        files = sorted(self.out.rglob("*.csv.gz")) + sorted(self.out.rglob("*.csv"))
+        files = [f for f in files if f.name not in ("manifest.csv",
+                                                    "variable_inventory.csv",
+                                                    "integrity_report.csv")]
+        if not files:
+            print(f"no data files under {self.out}")
+            return []
 
-        for year in years:
-            for level in levels:
-                try:
-                    avail = self.datasets_for(year, level)
-                except Exception as e:  # noqa: BLE001
-                    print(f"{year} {level}: cannot enumerate: {e}", flush=True)
-                    continue
-                if datasets:
-                    want = {d.upper() for d in datasets}
-                    avail = [a for a in avail if a[0].upper() in want]
-                if not avail:
-                    continue
-                # REF first: it defines the entity universe for the year.
-                avail.sort(key=lambda a: a[0].upper() != "REF")
-                endpoint = self._endpoint_for(year)
-                print(f"\n=== {year} / {LEVELS[level][0]} ({endpoint}) ===", flush=True)
+        recorded = {}
+        man = self.out / "manifest.json"
+        if man.exists():
+            try:
+                for r in json.loads(man.read_text()):
+                    if r.get("path"):
+                        recorded[Path(r["path"]).name] = r
+            except Exception:  # noqa: BLE001
+                pass
 
-                for code, _label, hidden in avail:
-                    rec = {"year": year, "level": level, "dataset": code,
-                           "endpoint": endpoint, "status": "", "n_rows": 0,
-                           "n_cols": 0, "keys_offered": 0, "keys_sent": 0,
-                           "var_types": "", "ragged_rows": 0, "dup_ids": 0,
-                           "blank_ids": 0,
-                           "ids_in_ref": 0, "ids_not_in_ref": 0,
-                           "ref_universe": 0, "coverage_pct": "", "bytes": 0,
-                           "note": ""}
-                    try:
-                        if endpoint == "wizard":
-                            content, keys_off, keys_sent, vts = self._wizard_verified(
-                                year, level, code, hidden or {})
-                            rec["keys_offered"], rec["keys_sent"] = keys_off, keys_sent
-                            rec["var_types"] = "|".join(vts)
-                        else:
-                            content, _, _, vts = self.legacy_download(year, level, code)
-                        rec["bytes"] = len(content)
+        bad, tot_rows = [], 0
+        by_year = collections.defaultdict(lambda: [0, 0])
+        for p in files:
+            try:
+                raw = (gzip.open(p, "rb").read() if p.suffix == ".gz"
+                       else p.read_bytes())
+                rows = [r for r in csv.reader(io.StringIO(raw.decode("latin-1")))
+                        if r and any(c.strip() for c in r)]
+                if len(rows) < 2:
+                    bad.append((p.name, f"only {len(rows)} row(s)")); continue
+                n_hdr = 2 if (len(rows) > 2 and self._looks_like_varnames(rows[1])
+                              and not self._looks_like_varnames(rows[0])) else 1
+                hdr, data = rows[n_hdr - 1], rows[n_hdr:]
+                ragged = sum(1 for r in data if len(r) != len(hdr))
+                if ragged:
+                    bad.append((p.name, f"{ragged} ragged rows")); continue
+                if not data:
+                    bad.append((p.name, "header only")); continue
+                rec = recorded.get(p.name)
+                if rec and rec.get("sha256"):
+                    if hashlib.sha256(raw).hexdigest() != rec["sha256"]:
+                        bad.append((p.name, "sha256 differs from manifest")); continue
+                elif backfill:
+                    fm = re.search(r"tapr_(\d{4})_([CDRSO])_(.+)\.csv(?:\.gz)?$",
+                                   p.name)
+                    if fm:
+                        yr, lv, ds = int(fm.group(1)), fm.group(2), fm.group(3)
+                        # The wizard route is the only one that emits two header
+                        # rows, so the header shape identifies the endpoint.
+                        ep = ("wizard" if n_hdr == 2
+                              else "advanced" if yr >= MODERN_FROM else "legacy")
+                        self.results.append(Result(
+                            year=yr, level=lv, level_name=LEVELS[lv][0],
+                            dataset=ds, endpoint=ep, status="ok",
+                            path=str(p), bytes=p.stat().st_size,
+                            sha256=hashlib.sha256(raw).hexdigest(),
+                            n_rows=len(data), n_cols=len(hdr),
+                            n_header_rows=n_hdr,
+                            message="sha256 backfilled from file on disk; "
+                                    "original download checksum not recorded"))
+                tot_rows += len(data)
+                m = re.search(r"_(\d{4})_", p.name)
+                yr = m.group(1) if m else "?"
+                by_year[yr][0] += 1
+                by_year[yr][1] += len(data)
+            except Exception as e:  # noqa: BLE001
+                bad.append((p.name, f"{type(e).__name__}: {e}"))
 
-                        ok, nr, nc, nh, msg = self.validate(
-                            content, endpoint,
-                            expect_data=bool(rec["var_types"]))
-                        rec["n_rows"], rec["n_cols"] = nr, nc
-                        if not ok:
-                            rec["status"] = "ABSENT" if "SAS broker error" in msg else "BAD"
-                            rec["note"] = msg
-                            rows.append(rec)
-                            self._print_receipt(rec)
-                            self._pause()
-                            continue
+        print(f"\n{len(files)} files under {self.out}\n")
+        print(f"{'year':<8}{'files':>7}{'data rows':>13}")
+        for y in sorted(by_year):
+            print(f"{y:<8}{by_year[y][0]:>7}{by_year[y][1]:>13,}")
+        print(f"\ntotal data rows: {tot_rows:,}")
+        checked = sum(1 for p in files if recorded.get(p.name, {}).get("sha256"))
+        print(f"checksums verified against manifest: {checked}/{len(files)}")
+        if backfill and self.results:
+            self.manifest()
+            print(f"checksums backfilled into manifest:  {len(self.results)}")
+        print(f"result: {'PASS' if not bad else f'FAIL ({len(bad)} files)'}")
+        for n, e in bad[:25]:
+            print(f"   {n}: {e}")
+        return bad
 
-                        parsed = [r for r in csv.reader(
-                            io.StringIO(content.decode("latin-1")))
-                            if r and any(c.strip() for c in r)]
-                        names, data = parsed[nh - 1], parsed[nh:]
-                        rec["ragged_rows"] = sum(1 for r in data if len(r) != len(names))
+    # -- endpoint health ---------------------------------------------------
 
-                        # Pick the id column by PRIORITY, not by position. From
-                        # 2021 TEA reordered the identifier block to
-                        # COUNTY, REGION, DISTRICT..., so taking the first
-                        # match picks REGION and every district then looks like
-                        # a duplicate. Ask for the finest available grain.
-                        upper = [n.strip().upper() for n in names]
-                        idx = next((upper.index(w) for w in
-                                    ("CAMPUS", "DISTRICT", "REGION", "SUMLEV")
-                                    if w in upper), None)
-                        if idx is not None:
-                            raw = [r[idx].strip().lstrip("'") for r in data
-                                   if len(r) > idx]
-                            # PKEFF and KG carry rows whose id column is blank
-                            # (TEA writes a bare apostrophe). Count those
-                            # separately: they are rows to drop on import, not
-                            # genuine duplicate entities.
-                            rec["blank_ids"] = sum(1 for v in raw if not v)
-                            ids = [v for v in raw if v]
-                            c = collections.Counter(ids)
-                            rec["dup_ids"] = sum(v - 1 for v in c.values() if v > 1)
-                            key = (year, level)
-                            if code.upper() == "REF":
-                                universe[key] = set(ids)
-                            uni = universe.get(key)
-                            if uni:
-                                s = set(ids)
-                                rec["ref_universe"] = len(uni)
-                                rec["ids_in_ref"] = len(s & uni)
-                                rec["ids_not_in_ref"] = len(s - uni)
-                                rec["coverage_pct"] = f"{100*len(s & uni)/len(uni):.1f}"
+    def health(self):
+        """Probe every TEA interface this tool depends on. Cheap and fast.
 
-                        problems = []
-                        if rec["ragged_rows"]:
-                            problems.append(f"{rec['ragged_rows']} ragged rows")
-                        if rec["dup_ids"]:
-                            problems.append(f"{rec['dup_ids']} duplicate ids")
-                        if rec["blank_ids"]:
-                            problems.append(f"{rec['blank_ids']} blank ids")
-                        if rec["ids_not_in_ref"]:
-                            problems.append(f"{rec['ids_not_in_ref']} ids not in REF")
-                        if rec["keys_offered"] and rec["keys_sent"] != rec["keys_offered"]:
-                            problems.append(
-                                f"sent {rec['keys_sent']}/{rec['keys_offered']} keys")
-                        rec["status"] = "FAIL" if problems else "OK"
-                        rec["note"] = "; ".join(problems)
-                    except Exception as e:  # noqa: BLE001
-                        rec["status"] = "ERROR"
-                        rec["note"] = f"{type(e).__name__}: {e}"
-                    rows.append(rec)
-                    self._print_receipt(rec)
-                    self._pause()
-
-        self._write_receipts(rows)
-        return rows
-
-    def _wizard_verified(self, year, level, dsname, step2_hidden):
-        """Wizard download that counts offered controls independently.
-
-        The point is to catch a parser that silently drops controls. `keys_off`
-        comes from a raw regex over the HTML, `keys_sent` from the HTML parser
-        the downloader actually uses. If they disagree, the parser is losing
-        columns and every file it produced is short.
+        Run before any large job, and on a schedule if this is automated. The
+        point is to catch TEA-side changes as endpoint failures with names,
+        rather than as mysterious empty downloads later. Each probe validates
+        CONTENT, because TEA answers HTTP 200 for every failure mode.
         """
-        data = dict(step2_hidden)
-        data.update({"dsname": dsname, "step": "3"})
-        r = self._req("POST", BROKER, data=data)
-        keys_off = len(re.findall(r"<input[^>]+name=['\"]key['\"]", r.text, re.I))
-        vts_off = len(re.findall(r"<input[^>]+name=['\"]var_type['\"]", r.text, re.I))
+        checks = []
 
-        fp = FormParser(); fp.feed(r.text)
-        keys = [v for n, v, _ in fp.checkboxes if n == "key"]
-        var_types = [v for n, v, _ in fp.checkboxes if n == "var_type"]
-        if len(var_types) != vts_off:
-            raise RuntimeError(f"var_type parse mismatch: {len(var_types)} vs {vts_off}")
-        fmts = fp.selects.get("datafmt", ["csv"])
-        action = fp.form_action or "/cgi/sas/broker/"
+        def probe(name, fn):
+            try:
+                detail = fn()
+                checks.append((name, True, detail))
+                print(f"  [OK]   {name:<34} {detail}", flush=True)
+            except Exception as e:  # noqa: BLE001
+                checks.append((name, False, str(e)))
+                print(f"  [FAIL] {name:<34} {type(e).__name__}: {str(e)[:70]}",
+                      flush=True)
+            self._pause(0.5)
 
-        post = [(k, v) for k, v in fp.hidden.items()]
-        post += [("key", k) for k in keys]
-        post += [("var_type", v) for v in var_types]
-        post.append(("datafmt", "csv" if "csv" in fmts else fmts[0]))
-        self._pause(0.5)
-        r2 = self._req("POST", requests.compat.urljoin(BROKER, action), data=post)
-        return r2.content, keys_off, len(keys), var_types
+        def _expect_csv(content, what):
+            ok, nr, nc, _, msg = self.validate(content, "legacy")
+            if not ok:
+                raise RuntimeError(f"{what}: {msg}")
+            return f"{nr:,} rows x {nc} cols"
 
-    @staticmethod
-    def _print_receipt(rec):
-        mark = {"OK": "OK", "ABSENT": "--", "BAD": "!!", "FAIL": "!!",
-                "ERROR": "XX"}.get(rec["status"], "??")
-        if rec["status"] == "OK":
-            cov = f"cov {rec['coverage_pct']}%" if rec["coverage_pct"] else ""
-            keys = (f"keys {rec['keys_sent']}/{rec['keys_offered']}"
-                    if rec["keys_offered"] else "")
-            vt = f"vt {rec['var_types']}" if rec["var_types"] else ""
-            print(f"  [{mark}] {rec['dataset']:<12} {rec['n_rows']:>7,} x "
-                  f"{rec['n_cols']:>5,}  {rec['bytes']/1e6:>7.2f} MB  "
-                  f"{keys:<12} {vt:<10} {cov}", flush=True)
-        else:
-            print(f"  [{mark}] {rec['dataset']:<12} {rec['note'][:78]}", flush=True)
+        print(f"\nTEA endpoint health  {time.strftime('%Y-%m-%d %H:%M')}\n")
 
-    def _write_receipts(self, rows):
-        """Write the machine-readable report and print the year x dataset grid."""
-        import collections
-        dest = self.out / "integrity_report.csv"
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        cols = ["year", "level", "dataset", "endpoint", "status", "n_rows", "n_cols",
-                "keys_offered", "keys_sent", "var_types", "ragged_rows", "dup_ids",
-                "blank_ids",
-                "ref_universe", "ids_in_ref", "ids_not_in_ref", "coverage_pct",
-                "bytes", "note"]
-        with open(dest, "w", newline="") as f:
-            w = csv.DictWriter(f, fieldnames=cols)
-            w.writeheader()
-            for r in rows:
-                w.writerow({c: r.get(c, "") for c in cols})
+        probe("legacy setpick (2019 D REF)",
+              lambda: _expect_csv(self.legacy_download(2019, "D", "REF")[0],
+                                  "legacy route"))
+        probe("advanced setpick (2024 D REF)",
+              lambda: _expect_csv(self.legacy_download(2024, "D", "REF")[0],
+                                  "advanced route"))
+        probe("advanced setpick (2025 D REF)",
+              lambda: _expect_csv(self.legacy_download(2025, "D", "REF")[0],
+                                  "advanced route, ccyy=2025"))
 
-        for level in sorted({r["level"] for r in rows}):
-            sub = [r for r in rows if r["level"] == level]
-            years = sorted({r["year"] for r in sub})
-            dsets = sorted({r["dataset"] for r in sub})
-            grid = {(r["year"], r["dataset"]): r for r in sub}
-            print(f"\n{'='*(16 + 8*len(years))}")
-            print(f"RECEIPTS - {LEVELS[level][0]}: columns returned per dataset x year")
-            print(f"{'='*(16 + 8*len(years))}")
-            print(f"{'dataset':<14}" + "".join(f"{y%100:>8}" for y in years))
-            for d in dsets:
-                cells = []
-                for y in years:
-                    r = grid.get((y, d))
-                    if r is None:
-                        cells.append("     ...")
-                    elif r["status"] == "OK":
-                        cells.append(f"{r['n_cols']:>8,}")
-                    elif r["status"] == "ABSENT":
-                        cells.append("       -")
-                    else:
-                        cells.append("    FAIL")
-                print(f"{d:<14}" + "".join(cells))
-            print(f"\n{'rows':<14}" + "".join(
-                f"{(grid.get((y,'REF')) or {}).get('n_rows',0):>8,}" for y in years)
-                + "   <- REF entity universe")
+        def _wizard():
+            cats, hidden = self.modern_datasets(2025, "D")
+            if len(cats) < 30:
+                raise RuntimeError(f"only {len(cats)} dsnames on the step-2 page")
+            if not hidden.get("sumlev"):
+                raise RuntimeError("step-2 hidden fields incomplete")
+            return f"{len(cats)} dsnames offered"
+        probe("wizard step-2 page (2025 D)", _wizard)
 
-            c = collections.Counter(r["status"] for r in sub)
-            print(f"\n  {LEVELS[level][0]}: " + "  ".join(
-                f"{k}={v}" for k, v in sorted(c.items())))
-            bad = [r for r in sub if r["status"] in ("FAIL", "BAD", "ERROR")]
-            if bad:
-                print(f"  {len(bad)} needing attention:")
-                for r in bad:
-                    print(f"    {r['year']} {r['dataset']:<12} {r['status']}: {r['note'][:64]}")
-            ragged = sum(r["ragged_rows"] for r in sub)
-            dups = sum(r["dup_ids"] for r in sub)
-            blanks = sum(r.get("blank_ids", 0) for r in sub)
-            short = [r for r in sub if r["keys_offered"] and r["keys_sent"] != r["keys_offered"]]
-            print(f"\n  rectangular: {'PASS' if ragged == 0 else f'FAIL ({ragged} ragged rows)'}")
-            print(f"  unique ids : {'PASS' if dups == 0 else f'FAIL ({dups} duplicates)'}")
-            print(f"  non-blank  : {'PASS' if blanks == 0 else f'{blanks} rows with a blank id (drop on import)'}")
-            print(f"  key capture: {'PASS' if not short else f'FAIL ({len(short)} short)'}")
-        print(f"\nwrote {dest}")
+        def _years():
+            r = self._req("GET", f"{TAPR_ROOT}/tapr_dd_download.html",
+                          params={"year": 2025})
+            years = re.findall(r'<option[^>]*value="?(\d{4})"?', r.text)
+            if not years:
+                raise RuntimeError("no ccyy options found on the download page")
+            return "ccyy offered: " + ", ".join(sorted(set(years)))
+        probe("wizard year list", _years)
+
+        def _dict():
+            r = self._req("GET", BROKER, params={
+                "_service": "marykay", "_program": "perfrept.perfmast.sas",
+                "_debug": "0", "ccyy": 2024, "sumlev": "D", "dsname": "REF",
+                "dd": "ref", "asvab": "",
+                "prgopt": "reports/tapr/dd/dd_tapr_dictionary.sas"})
+            n = len(re.findall(r'class="tooltiptext"', r.text))
+            if n < 5:
+                raise RuntimeError(f"only {n} dictionary entries returned")
+            return f"{n} labelled variables (2024 REF)"
+        probe("dictionary endpoint", _dict)
+
+        failed = [c for c in checks if not c[1]]
+        print(f"\n{'PASS' if not failed else 'FAIL'}: "
+              f"{len(checks) - len(failed)}/{len(checks)} endpoints healthy")
+        if failed:
+            print("A failed probe means TEA changed something on their side.")
+            print("See HANDOFF.md section 9 for what each endpoint feeds.")
+        return failed
 
     def audit(self, years, levels, datasets=None):
         """Emit a varname x year inventory without keeping the data.
@@ -961,6 +922,14 @@ def main(argv=None):
     ap.add_argument("--force", action="store_true")
     ap.add_argument("--audit-years", default=None,
                     help="write variable_inventory.csv for these years and exit")
+    ap.add_argument("--check", action="store_true",
+                    help="verify files already on disk (gzip, rectangular, "
+                         "sha256 vs manifest) and exit; no downloads")
+    ap.add_argument("--backfill", action="store_true",
+                    help="with --check: record a checksum for files that pass "
+                         "but have none in the manifest")
+    ap.add_argument("--health", action="store_true",
+                    help="probe every TEA endpoint this tool depends on and exit")
     ap.add_argument("--verify", action="store_true",
                     help="integrity check: prove extracts are complete and "
                          "rectangular, print receipts, write integrity_report.csv")
@@ -975,6 +944,12 @@ def main(argv=None):
                         dictionaries=not a.no_dictionary,
                         route=("wizard" if a.route == "wizard" else "auto"),
                         prefer_wizard=(a.route == "wizard"))
+    if a.health:
+        failed = dl.health()
+        return 1 if failed else 0
+    if a.check:
+        bad = dl.check_downloads(backfill=a.backfill)
+        return 1 if bad else 0
     if a.audit_years:
         dl.audit(parse_years(a.audit_years), a.levels, a.datasets)
         return 0

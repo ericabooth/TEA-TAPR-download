@@ -248,41 +248,75 @@ python3 portal_probe.py --query --all-districts --batch 25
 python3 portal_probe.py --query --all-campuses  --batch 25
 ```
 
-## 7. Suggested module design
+## 7. The downloader
 
-This does not belong inside `tapr_download.py`. It is a JSON API with async job
-semantics, not an HTML form scrape. Add it as a sibling module sharing the core:
+`portal_download.py` implements all of the above. It is a sibling of
+`tapr_download.py`, not part of it: this is a JSON API with async job semantics,
+not an HTML form scrape.
 
-```
-tea/portal.py
-    class PortalClient:
-        client_info()                        # GET /Client/{id}
-        organizations(level, search=None)    # POST /Organization/Query, paginated
-        walk(picks: dict) -> selection       # sequential QuerySelection walk
-        run(selection, org_ids) -> queryHash # POST /Query/Run, handle 202
-        wait(queryHash)                      # poll /Query/Status
-        download_csv(body) -> bytes          # POST /Query/Download
+```bash
+python3 portal_download.py --list                    # assessments, reports, administrations
+python3 portal_download.py --estimate --levels D     # slices and request count
+python3 portal_download.py --levels D --administrations "Spring 2024"
 ```
 
-Practical notes for the implementation:
+Output: `portal_data/<assessment>/<report>/<administration>_<level>.csv.gz`
+plus `manifest.csv` (status, rows, cols, bytes, sha256, seconds per slice).
+Runs resume; existing slices are skipped.
 
-- **Cache the wizard walk.** A full crawl is assessments x reports x
-  administrations x subjects x versions x grades, and re-walking for every
-  combination is thousands of avoidable POSTs. Walk once per
-  (assessment, report, administration) and vary only the leaf steps.
-- **The crawl is large.** 7 x 6 x 36 x 4 x 3 x 6 is the upper bound before you
-  even add 11,363 campuses. Decide the slice you actually need. A sane first
-  target is one administration per school year, `Standard Summary`, all
-  subjects and grades, at district level.
-- **Prefer the district level for bulk**, then pull campuses only for the
-  districts you need. 11,363 campus queries is a lot of jobs.
-- **Respect the async contract.** Poll `/Query/Status`; do not hammer
-  `/Query/Run`.
-- **Reuse the pacing and retry logic** already in `tapr_download.py`. Nothing
-  observed suggests this API is rate-limited the way `rptsvr1` is, but pace it
-  anyway.
-- **Record `aggMin`** (5) alongside the data so the suppression rule travels
-  with it, and map suppressed cells to `.a` per [PLAN.md](PLAN.md).
+### What keeps the crawl tractable
+
+**Multi-select.** `subjects` and `grades` carry `allowFieldMutiSelect: true`,
+and the API honours it: selecting all 4 subjects and all 6 grades returns one
+table with subjects as column blocks and grades as rows. That is 24 queries
+collapsed into 1. Verified at 74 columns per district-administration.
+
+**Batching.** Organizations go in groups. Measured ceiling:
+
+| batch size | result |
+|---|---|
+| 60, 80, 100, 150 | works |
+| 200, 250, 300 | **HTTP 500**, consistently, across retries |
+| 500, 1314 | HTTP 500 |
+
+The default is 100, the cap is 150. District level is 14 requests per slice,
+campus level about 76.
+
+### Guards worth knowing about
+
+Batches are concatenated into one file per slice, so two failure modes get
+explicit checks rather than silent corruption:
+
+- **Header drift between batches** aborts the slice. Concatenating tables whose
+  columns disagree would misalign every row after the first batch.
+- **Ragged rows** against the header abort the slice.
+
+The retry loop in `run_query()` is also load-bearing: a freshly computed query
+can answer 200 with an empty table before the result is actually available.
+A single attempt silently under-reports.
+
+### Verified
+
+STAAR 3-8, Group Summary, all 4 subjects x all 6 grades per query:
+
+| level | administration | rows | cols | batches | time |
+|---|---|---|---|---|---|
+| State | Spring 2019 | 6 | 94 | 1 | 8s |
+| State | Spring 2024 | 6 | 74 | 1 | - |
+| District | Spring 2023 | 6,947 | 74 | 14 | 77s |
+| District | Spring 2024 | 6,957 | 74 | 14 | - |
+| Campus | Spring 2024 | 21,860 | 74 | 76 | 411s |
+
+0 ragged rows throughout. `ID/CDC` widths are exactly 6 at district level and
+exactly 9 at campus level, so the join to TAPR is direct. 6,937 distinct
+campuses and ~1,190 of 1,314 districts appear, which is expected: high-school
+only campuses and charters have no STAAR 3-8.
+
+Note the state file has 94 columns in 2019 and 74 in 2024. Column counts move
+between years because TEA changes what it reports, the same comparability
+problem documented for TAPR in [PLAN.md](PLAN.md). Budget for it.
+
+Cost basis for planning: a district slice is ~80s, a campus slice ~7 minutes.
 
 ## 8. Where the limits are, and where to stop
 

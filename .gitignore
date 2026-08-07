@@ -1,5 +1,12 @@
 .DS_Store
 __pycache__/
 *.pyc
+*.log
 tapr_data/
+portal_data/
+stata_stage/
+stata_build/
+stata_docs/
+dictionaries/
+tapr_example/
 test_out*/

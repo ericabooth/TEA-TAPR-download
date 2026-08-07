@@ -1,35 +1,38 @@
-# TEA TAPR data downloader
+# TEA-TAPR-download
 
-Downloads **Texas Academic Performance Report (TAPR)** flat files from the Texas
-Education Agency, across school years, aggregation levels and data categories.
+Python tools for bulk-downloading school data from the Texas Education Agency
+(TEA):
 
-TEA's TAPR site has no API and no resolvable download URLs — it drives a SAS
-"broker" CGI through a series of dropdowns, radio buttons and checkboxes. This
-project automates that form flow and records enough metadata alongside each file
-to build a longitudinal panel afterwards.
+- **TAPR** — Texas Academic Performance Reports, school years 2012-13 through
+  2024-25, at campus, district, region, and state level.
+- **Texas Assessment Research Portal** — STAAR, STAAR Alternate 2, and TELPAS
+  results with twelve student-group breakdowns (including Section 504,
+  gifted/talented, Title I, and migrant status) that TAPR does not carry.
 
-## Files
-
-| file | what it is |
-|---|---|
-| **`tapr_download.py`** | The downloader. Routes each year to the right one of TEA's three download interfaces, validates responses, retries, resumes, and writes a manifest. **Use this.** |
-| `tapr_scraper_full.py` | Original scraper. **Superseded — do not use.** It silently downloads empty files; see [DEBUGGING.md](DEBUGGING.md). Kept for reference. |
-| `tapr_example_district.py` | Minimal single-file example against the wizard route. Still works, useful for checking connectivity. |
-| `portal_probe.py` | Working client for the Texas Assessment Research Portal JSON API (statewide, district and campus, batched, with CSV export). |
-| [`DEBUGGING.md`](DEBUGGING.md) | What was broken, what was verified against the live site, and TEA's own broken links. |
-| [`PLAN.md`](PLAN.md) | Plan for the longitudinal build and the Stata merge/label/clean workflow. |
-| [`SOURCES.md`](SOURCES.md) | What TAPR misses: other TEA data products, verified, with download recipes. |
-| [`PORTAL.md`](PORTAL.md) | txresearchportal.com API map and scripting plan (STAAR, STAAR Alt 2, TELPAS, with 12 breakdown dimensions TAPR does not have). |
+TEA publishes this data behind multi-step web forms with no API, no bulk
+download, and no stable file URLs. These scripts automate the forms and add
+what a reliable bulk download needs: routing across TEA's several download
+interfaces, response validation, retry with backoff, resume, and a manifest
+with checksums.
 
 ## Requirements
 
-Python 3.9+ and `requests`:
+Python 3.9+. `tapr_download.py` needs `requests`; the portal scripts use the
+standard library only. `fetch_dictionaries.py` needs `pdftotext`
+(`brew install poppler`).
 
 ```bash
 pip install requests
 ```
 
-## Usage
+## Quick start
+
+Probe TEA's endpoints first — a site-side change shows up as a named failure
+instead of a mysterious empty download later:
+
+```bash
+python3 tapr_download.py --health
+```
 
 Download district and campus files for all available years:
 
@@ -43,55 +46,13 @@ A single dataset, to try it out:
 python3 tapr_download.py --years 2024 --levels D --datasets REF
 ```
 
-Prove the extracts are complete and rectangular, and print receipts:
-
-```bash
-python3 tapr_download.py --verify --years 2013-2025 --levels D
-```
-
-Write a variable inventory (one row per year x level x dataset x variable, with
-TEA's label text) without keeping the data — this is the input to the
-label-drift crosswalk described in `PLAN.md`:
-
-```bash
-python3 tapr_download.py --audit-years 2013-2025 --levels D
-```
-
-### Options
-
-| flag | default | meaning |
-|---|---|---|
-| `--years` | `2013-2025` | `2013-2025`, or `2019,2021`, or a mix |
-| `--levels` | `C D` | `C` campus, `D` district, `R` region, `S` state, `O` county (county is wizard-only, and TEA's county page is broken) |
-| `--datasets` | all | e.g. `REF STAAR1` (setpick) or `REF STUD STAAR_ALL` (wizard). Codes differ by route — see below |
-| `--output` | `tapr_data` | output directory |
-| `--pace` | `2.5` | base seconds between requests. Do not lower this much; TEA throttles |
-| `--no-compress` | off | write plain `.csv` instead of `.csv.gz` |
-| `--no-dictionary` | off | skip saving TEA's data-dictionary pages |
-| `--force` | off | re-download files that already exist |
-| `--audit-years` | — | write `variable_inventory.csv` and exit |
-| `--verify` | off | integrity check; prints receipts, writes `integrity_report.csv` |
-| `--route` | `auto` | `auto`, `setpick` or `wizard` — see below |
-
-## Output layout
-
-```
-tapr_data/
-  manifest.csv              status, dimensions, SHA-256 for every request
-  manifest.json
-  variable_inventory.csv    (--audit-years only)
-  2024/
-    Districts/
-      tapr_2024_D_REF.csv.gz
-      _dictionary/REF.html
-    Campuses/
-      ...
-```
-
 Runs resume: files already present are skipped, so an interrupted run can be
 restarted with the same command.
 
-## The routes
+**Year convention:** `--years` takes TEA's `ccyy`, the **spring** year, so
+`--years 2025` means school year 2024-25.
+
+## The TAPR routes
 
 TEA serves TAPR through incompatible interfaces whose dataset codes differ, so
 `--datasets` values are not interchangeable between them.
@@ -107,87 +68,144 @@ numerator/denominator/rate coverage, year-embedded variable names — for every
 year from 2013, then switches to the wizard for SY 2024-25 onward, where the
 setpick route has no assessment data.
 
-Note the year convention: `--years` takes `ccyy`, the **spring** year, so
-`--years 2025` means school year 2024-25.
+### Options
 
-Use `--route wizard` to force the wizard everywhere, for the categories only it
-offers (`STUD`, `STAF`, `STAAR_ALL`, `DROP_ATT`, `PK`, `APIB`, `TXIHE`).
-Use `--route setpick` to force the setpick route, which still returns the
-non-assessment datasets (`REF`, `GRAD`, `COMP`, `PERF1`-`3`, `PROF`, `KG`,
-`PKEFF`) for SY 2024-25 if you want schema continuity for those.
-
-Run without `--datasets` to get everything available for each year.
-
-## Verifying integrity
-
-`--verify` downloads each dataset and checks it rather than trusting that a
-200 response means data. Per year x level x dataset it reports:
-
-| check | meaning |
-|---|---|
-| `rectangular` | every data row has exactly as many fields as the header — catches truncation |
-| `key capture` | the parser submitted every `key` the page offered, counted independently of the parser |
-| `unique ids` | no duplicate entity ids |
-| `non-blank` | rows whose id column is empty (TEA writes a bare apostrophe in some datasets) |
-| `coverage` | entity ids reconciled against that year's `REF` universe |
-
-It ends with a receipts grid of columns returned per dataset x year, so a
-dataset that silently shrank is visible at a glance, and writes
-`integrity_report.csv` for the details.
-
-Results so far:
-
-| run | scope | result |
+| flag | default | meaning |
 |---|---|---|
-| District, 2013-2025 | 260 dataset-years | rectangular **PASS**, key capture **PASS**; 6 real issues (below) |
-| Campus, 2019/2024/2025 | 83 dataset-years | rectangular **PASS**, unique ids **PASS**, non-blank **PASS**, key capture **PASS**; 1 real issue |
+| `--years` | `2013-2025` | `2013-2025`, or `2019,2021`, or a mix (spring years) |
+| `--levels` | `C D` | `C` campus, `D` district, `R` region, `S` state |
+| `--datasets` | all | e.g. `REF STAAR1` (setpick) or `REF STUD STAAR_ALL` (wizard) |
+| `--output` | `tapr_data` | output directory |
+| `--pace` | `2.5` | base seconds between requests; do not lower it — TEA throttles |
+| `--route` | `auto` | `auto`, `setpick` or `wizard` |
+| `--health` | off | probe every TEA endpoint (6 checks) and exit |
+| `--verify` | off | integrity check against the live site; prints receipts, writes `integrity_report.csv` |
+| `--check` | off | verify files already on disk (gzip, rectangular, sha256 vs manifest) |
+| `--backfill` | off | with `--check`: record checksums for files that lack one |
+| `--audit-years` | — | write a variable inventory (names and labels per year) and exit |
+| `--force` | off | re-download files that already exist |
+| `--no-compress` | off | write plain `.csv` instead of `.csv.gz` |
 
-Nothing is being truncated and every column TEA offers is being requested. The
-real issues are TEA data characteristics to handle on import, not download
-defects:
+### Output layout
 
-- `PKEFF` and `KG` carry rows with a **blank district id** (a bare apostrophe):
-  76 rows in `PKEFF` 2022, 27 in 2023. Drop them on import.
-- A few entities appear in `KG` (11-18 districts/yr, 81 campuses in 2019),
-  `PKEFF` (8-10) and `ACCLER` (1) but **not in that year's `REF`**.
-
-## Scale
-
-Campus level is large: the 2024 campus `STAAR_ALL` extract alone is 20 MB raw
-(1,100 columns x 9,082 campuses), 6.5 MB gzipped. A full campus + district run
-across 2013-2025 is on the order of 10-30 GB gzipped, and takes hours — the
-pacing is deliberate and TEA will drop connections if you rush it.
-
-## Before you use the data
-
-Read [`PLAN.md`](PLAN.md) first. TAPR files are not appendable as they stand:
-the two-digit year is embedded in every variable name, labels embed the year,
-variables appear and disappear, column order moves, 2022 uses mixed-case names
-and 2023 prefixes every ID with an apostrophe. `PLAN.md` documents the
-harmonisation rules and the Stata-side workflow.
-
-The largest seam is at SY 2024-25, where the panel has to change routes because
-the setpick route carries no assessment data for that year. See
-[`DEBUGGING.md`](DEBUGGING.md) for the evidence and the reason.
-
-## Assessment portal
-
-`portal_probe.py` is a working client for TEA's Texas Assessment Research
-Portal, which carries student-group breakdowns TAPR does not have — `gifted`,
-`plan_504`, `titleia_flag`, `migrant` — plus STAAR Alternate 2 and TELPAS.
-
-```bash
-python3 portal_probe.py --map
+```
+tapr_data/
+  manifest.csv              status, dimensions, SHA-256 for every request
+  manifest.json
+  2024/
+    Districts/
+      tapr_2024_D_REF.csv.gz
+      _dictionary/REF.html
+    Campuses/
+      ...
 ```
 
+### Verifying integrity
+
+TEA answers HTTP 200 for every failure mode — error stubs, throttle pages, and
+empty bodies all arrive as 200 — so "it downloaded" proves nothing. `--verify`
+re-downloads each dataset and checks it: every row matches the header width,
+every offered column was requested, entity ids are unique and reconcile against
+that year's reference file. It ends with a receipts grid of columns returned
+per dataset per year, so a dataset that silently shrank is visible at a glance.
+
+`--check` is the companion for data already on disk: gzip decodes, CSV parses,
+rows are rectangular, checksums match the manifest.
+
+## Why scraping TEA is tricky
+
+The short list; [`DEBUGGING.md`](DEBUGGING.md) documents each with evidence.
+
+- **HTTP 200 on every failure.** Validate structure, never status codes. Even
+  `Content-Type` on a successful download is an unresolved SAS macro.
+- **Throttling, two ways.** TEA drops TCP connections *and* returns HTTP 429
+  pages. A throttled response is indistinguishable from "no data for this
+  year" — re-run any negative finding slowly before believing it.
+- **The wizard route requires `var_type`.** Omit it and TEA returns identifier
+  columns only: a well-formed file with no data in it.
+- **Identifiers are zero-padded strings.** `DISTRICT` is 6 characters, `CAMPUS`
+  is 9. Read them as numeric and `001902` becomes `1902`.
+- **Apostrophe-guarded ids, 2021-2024.** Values arrive as `'001902` on the
+  setpick routes in those years. The scripts strip them.
+- **The year is embedded in variable names.** `DDA03ARE1019D` (2019) and
+  `DDA03ARE1023D` (2023) are the same measure; the two-digit year sits before
+  the trailing N/D/R suffix.
+- **Column order moves between years.** Find columns by name, never position.
+
+## Variable labels by year
+
+TAPR data files carry human-readable labels only from SY 2024-25. For earlier
+years the labels live in TEA's per-year data dictionary PDFs (not the glossary,
+which contains no variable names at all). `fetch_dictionaries.py` harvests both
+sources into one crosswalk:
+
 ```bash
-python3 portal_probe.py --query --all-districts --batch 50 --out staar.csv
+python3 fetch_dictionaries.py --years 2013-2025 --output dictionaries
 ```
 
-Output carries the TEA identifier in an `ID/CDC` column (6-digit CDN for
-districts, 9-digit campus id for campuses), so it joins to TAPR with no
-crosswalk. See [`PORTAL.md`](PORTAL.md) for the API map and the two non-obvious
-gotchas that make the difference between data and a 2-byte file.
+writes `dictionaries/variable_labels.csv`, one row per year x variable with
+TEA's label text. `--verify-dd` checks the harvest's dataset-code table against
+the live site and prints corrections if TEA has renamed anything.
+
+## Assessment Research Portal
+
+`portal_download.py` bulk-downloads STAAR / STAAR Alternate 2 / TELPAS results
+from `txresearchportal.com`, a public JSON API. See [`PORTAL.md`](PORTAL.md)
+for the full API documentation, including the two request quirks that make the
+difference between data and an empty file.
+
+```bash
+python3 portal_download.py --health
+python3 portal_download.py --list
+python3 portal_download.py --estimate --levels D
+python3 portal_download.py --levels D --administrations "Spring 2024"
+```
+
+Always `--estimate` before a large run. Organizations are batched (default 100
+per request; the server rejects 200+), subjects and grades are multi-selected
+into single queries, and output carries the TEA campus/district identifier in
+an `ID/CDC` column, so it joins to TAPR directly. Runs resume; a manifest
+records every slice.
+
+## Post-processing for Stata
+
+Two optional steps prepare the downloads for Stata and build a cross-year
+codebook:
+
+```bash
+python3 prep_stata.py --input tapr_data --output stata_stage
+stata-mp -b do build_codebook.do
+```
+
+`prep_stata.py` decompresses, normalises names, strips TEA's apostrophe
+guards, detects which columns must stay string (by content — any column holding
+a leading-zero numeric), and emits per-year `label var` do-files from the
+harvested dictionary. `build_codebook.do` (requires the `datadictionary`
+package, `ssc install datadictionary`) imports, appends, and writes per-year
+codebooks whose **Changes sheet** lists every variable added, dropped,
+relabelled, or retyped between consecutive years, plus presence, drift, and
+label-coverage reports.
+
+## Other TEA data
+
+[`SOURCES.md`](SOURCES.md) surveys TEA's other public data products —
+discipline, enrollment, accountability, graduation, directory data — with
+verified URLs and download mechanics for each.
+
+## Scale and responsible use
+
+A full campus-and-district TAPR sweep is on the order of 10-30 GB gzipped and
+takes hours; the pacing is deliberate. The scripts identify themselves with a
+contact address in the User-Agent rather than spoofing a browser — if you fork
+this, put your own contact there. Keep the default pacing; hammering the
+server gets connections dropped and, worse, produces responses that look like
+missing data.
+
+## Superseded
+
+`tapr_scraper_full.py` is the original scraper this project replaced. It runs
+without errors and downloads files that contain no data. It is kept only as a
+reference; [`DEBUGGING.md`](DEBUGGING.md) explains what was wrong with it.
 
 ## Author
 
